@@ -279,7 +279,7 @@ struct IKCPSEG
 	IUINT32 rto;
 	IUINT32 fastack;
 	IUINT32 xmit;
-	char data[1];
+	char data[1]; // 将 struct 的最后一个成员变量定义为 char [1]，可以动态地扩充 struct 的容量
 };
 
 
