@@ -800,7 +800,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 
 //---------------------------------------------------------------------
 // input data
-// KCP 本端通过该函数来收取数据，会从 data 中读取 size 个字节
+// KCP 本端通过该函数来收取来自下层的数据，会从 data 中读取 size 个字节
 //---------------------------------------------------------------------
 int ikcp_input(ikcpcb *kcp, const char *data, long size)
 {
