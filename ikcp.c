@@ -565,22 +565,30 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 
 //---------------------------------------------------------------------
 // parse ack
+// 传入 SampleRTT（样本 RTT），计算超时重传间隔
 //---------------------------------------------------------------------
 static void ikcp_update_ack(ikcpcb *kcp, IINT32 rtt)
 {
+	// 参考《计算机网络 自顶向下方法 第七版》
+	// 传入的形参 rtt 即 SampleRTT，是从某个报文段发出到收到该报文段的确认之间的时间间隔
+	// kcp->rx_srtt 是 Smoothed Round-Trip Time，即 EstimatedRTT，是 SampleRTT 的加权平均值
+	// kcp->rx_rttval 即 DevRTT，估算一个 SampleRTT 偏离 EstimatedRTT 的程度，反映出 SampleRTT 的波动情况
+	// kcp->rx_rto 即 TimeInterval，即最终确定的超时重传间隔
 	IINT32 rto = 0;
-	if (kcp->rx_srtt == 0) {
+	if (kcp->rx_srtt == 0) { // 初始状态下，即获得了第一个 SampleRTT
 		kcp->rx_srtt = rtt;
 		kcp->rx_rttval = rtt / 2;
 	}	else {
 		long delta = rtt - kcp->rx_srtt;
 		if (delta < 0) delta = -delta;
-		kcp->rx_rttval = (3 * kcp->rx_rttval + delta) / 4;
-		kcp->rx_srtt = (7 * kcp->rx_srtt + rtt) / 8;
+		kcp->rx_rttval = (3 * kcp->rx_rttval + delta) / 4; // DevRTT := 0.75 * DevRTT + 0.25 * |SampleRTT - EstimatedRTT|
+
+		kcp->rx_srtt = (7 * kcp->rx_srtt + rtt) / 8; // EstimatedRTT := 0.875 * EstimatedRTT + 0.125 * SampleRTT
+
 		if (kcp->rx_srtt < 1) kcp->rx_srtt = 1;
 	}
-	rto = kcp->rx_srtt + _imax_(kcp->interval, 4 * kcp->rx_rttval);
-	kcp->rx_rto = _ibound_(kcp->rx_minrto, rto, IKCP_RTO_MAX);
+	rto = kcp->rx_srtt + _imax_(kcp->interval, 4 * kcp->rx_rttval); // TimeInterval := EstimatedRTT + 4 * DevRTT
+	kcp->rx_rto = _ibound_(kcp->rx_minrto, rto, IKCP_RTO_MAX); // 根据下限 kcp->rx_minrto 和 上限 IKCP_RTO_MAX 对 TimeInterval 做一个 clip
 }
 
 /**
@@ -646,24 +654,29 @@ static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 	}
 }
 
+/**
+ * 对发送缓存中的 segment 的 fastack 变量进行维护
+ * 也就是根据确认号 sn 来累计发送缓存中 segment 被跳过次数，从而能够实现快速重传功能
+ */
 static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 {
 	struct IQUEUEHEAD *p, *next;
 
 	if (_itimediff(sn, kcp->snd_una) < 0 || _itimediff(sn, kcp->snd_nxt) >= 0)
-		return;
+		return; // 如果序号不在发送缓存的序号范围内，直接返回
 
-	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
-		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
+	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) { // 从头到尾遍历发送缓存
+		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node); // 取出当前节点对应的 segment
 		next = p->next;
-		if (_itimediff(sn, seg->sn) < 0) {
+
+		if (_itimediff(sn, seg->sn) < 0) { // 当前 segment 的序号大于 sn 则及时跳出遍历
 			break;
 		}
-		else if (sn != seg->sn) {
+		else if (sn != seg->sn) { // 在所有序号不超过 sn 的 segment 中，去除掉和 sn 相等的，那么剩下的自然都是序号小于 sn 的 segment
 		#ifndef IKCP_FASTACK_CONSERVE
-			seg->fastack++;
+			seg->fastack++; // 累计收到 ACK 时该 segment 被跳过次数
 		#else
-			if (_itimediff(ts, seg->ts) >= 0)
+			if (_itimediff(ts, seg->ts) >= 0) // 如果预定义了 IKCP_FASTACK_CONSERVE 则还会再多一层确认
 				seg->fastack++;
 		#endif
 		}
@@ -814,6 +827,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 	if (data == NULL || (int)size < (int)IKCP_OVERHEAD) return -1;
 
+	// 反复循环，取出 data 中的数据，组成一个个的 segment，直到 data 中的数据被取完
 	while (1) {
 		IUINT32 ts, sn, len, una, conv;
 		IUINT16 wnd;
@@ -850,19 +864,20 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 		if (cmd == IKCP_CMD_ACK) { // 接收到 ACK 类型的 segment，表示远端对本端发送过去的某个 segment 回复过来的一个确认
 
-			if (_itimediff(kcp->current, ts) >= 0) { // 根据当前时间 kcp->current 和时间戳字段 ts 计算 ###################### TODO ######################
-				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
+			if (_itimediff(kcp->current, ts) >= 0) { // 根据当前时间 kcp->current 和时间戳字段 ts 计算样本往返时间（Sample RTT）
+				// 这里需要注意我发收到的 ACK 类型 segment，它的 ts 字段，是其确认的我方发送的那个数据 segment 的发送时间点，因此可以这样计算样本 RTT
+				ikcp_update_ack(kcp, _itimediff(kcp->current, ts)); // 根据样本 RTT 更新超时重传间隔
 			}
 
 			ikcp_parse_ack(kcp, sn); // 传入当前接收到的 segment 的序号字段，由于是 ACK 类型，因此此时 sn 是确认号，尝试删除掉发送缓存中的某一个被确认的 segment
 			ikcp_shrink_buf(kcp); // 删除掉的有可能是发送缓存的首个 segment，因此要维护一下 kcp->snd_una
 
-			if (flag == 0) {
-				flag = 1; // 执行快速重传的标记
-				maxack = sn; // ###################### TODO ######################
-				latest_ts = ts; // ###################### TODO ######################
-			}	else {
-				if (_itimediff(sn, maxack) > 0) {
+			if (flag == 0) { // 如果循环中此前还没有接收到过 ACK 类型的 segment
+				flag = 1; // 标记上，接收到了 ACK 类型的 segment
+				maxack = sn; // maxack 是循环中所有 ACK 类型 segment 的确认号的最大值
+				latest_ts = ts;
+			}	else { // 如果循环中此前已经有接收到 ACK 类型 segment
+				if (_itimediff(sn, maxack) > 0) { // 则维护所有的 ACK 类型 segment 中确认号的最大值
 				#ifndef IKCP_FASTACK_CONSERVE
 					maxack = sn;
 					latest_ts = ts;
@@ -875,7 +890,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				}
 			}
 
-			if (ikcp_canlog(kcp, IKCP_LOG_IN_ACK)) { // ###################### TODO ######################
+			if (ikcp_canlog(kcp, IKCP_LOG_IN_ACK)) { // 打印日志
 				ikcp_log(kcp, IKCP_LOG_IN_ACK, 
 					"input ack: sn=%lu rtt=%ld rto=%ld", (unsigned long)sn, 
 					(long)_itimediff(kcp->current, ts),
@@ -936,21 +951,22 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		size -= len; // 计算剩余的字节数
 	}
 
-	if (flag != 0) {
-		ikcp_parse_fastack(kcp, maxack, latest_ts);
+	if (flag != 0) { // 根据 flag 判断整一个 while 循环取出的所有 segment 中，是否有 ACK 类型的 segment
+		// 存在 ACK 类型的 segment
+		ikcp_parse_fastack(kcp, maxack, latest_ts); // 那么根据这些 segment 的确认号最大值来更新发送缓存，从而能够实现快速重传功能
 	}
 
-	if (_itimediff(kcp->snd_una, prev_una) > 0) { // kcp->snd_una 更新了，说明本端收到了若干确认，发送窗口的左沿向右移动了
-		// 更新拥塞窗口 ###################### TODO ######################
-		if (kcp->cwnd < kcp->rmt_wnd) {
+	if (_itimediff(kcp->snd_una, prev_una) > 0) { // kcp->snd_una 更新了，说明远端收到且确认了我方发送缓存中的首个待确认的 segment
+		// 增大拥塞窗口
+		if (kcp->cwnd < kcp->rmt_wnd) { // 发送窗口由远端（剩余）接收窗口和拥塞窗口共同限制，因此只有当拥塞窗口小于远端（剩余）接收窗口时才会真正产生作用
 			IUINT32 mss = kcp->mss;
-			if (kcp->cwnd < kcp->ssthresh) {
-				kcp->cwnd++;
-				kcp->incr += mss;
-			}	else {
+			if (kcp->cwnd < kcp->ssthresh) { // 小于慢启动阈值，慢启动状态下指数级增长
+				kcp->cwnd++; // 注意，kcp->cwnd 是以 MSS 为单位的拥塞窗口
+				kcp->incr += mss; // kcp->incr 是以字节为单位的拥塞窗口
+			}	else { // 大于等于慢启动阈值，拥塞避免状态下线性增长
 				if (kcp->incr < mss) kcp->incr = mss;
-				kcp->incr += (mss * mss) / kcp->incr + (mss / 16);
-				if ((kcp->cwnd + 1) * mss <= kcp->incr) {
+				kcp->incr += (mss * mss) / kcp->incr + (mss / 16); // 拥塞窗口增长 MSS * (MSS / incr) 个字节
+				if ((kcp->cwnd + 1) * mss <= kcp->incr) { // kcp->cwnd 跟随 kcp->incr 增长
 				#if 1
 					kcp->cwnd = (kcp->incr + mss - 1) / ((mss > 0)? mss : 1);
 				#else
@@ -958,7 +974,8 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				#endif
 				}
 			}
-			if (kcp->cwnd > kcp->rmt_wnd) {
+
+			if (kcp->cwnd > kcp->rmt_wnd) { // 当超过远端（剩余）接收窗口时，拥塞窗口实际上并不会起作用
 				kcp->cwnd = kcp->rmt_wnd;
 				kcp->incr = kcp->rmt_wnd * mss;
 			}
@@ -971,7 +988,8 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 //---------------------------------------------------------------------
 // ikcp_encode_seg
-// 将 segment 编码成字节流，写入到 ptr 中
+// 将 segment 的首部部分编码成字节流，写入到 ptr 中
+// 传入的指针是写入的起始位置，返回的指针是写入的最后一个字节的下一个位置，即下次再写入时的起始位置
 //---------------------------------------------------------------------
 static char *ikcp_encode_seg(char *ptr, const IKCPSEG *seg)
 {
@@ -1032,10 +1050,10 @@ void ikcp_flush(ikcpcb *kcp)
 	// 将 acklist 中的 ack 转变为 ACK 类型的 segment，编码成字节流，拼接起来发送
 	count = kcp->ackcount;
 	for (i = 0; i < count; i++) {
-		size = (int)(ptr - buffer);
-		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) { // 当 buffer 中的字节流达到了一个 kcp->mtu 长度，就发送出去
+		size = (int)(ptr - buffer); // 计算当前 buffer 中的数据量，以字节计
+		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) { // 如果再加入当前这个 ACK segment，则 buffer 中的数据量会超过 MTU 限制，因此应将目前 buffer 中的数据先发送出去
 			ikcp_output(kcp, buffer, size);
-			ptr = buffer; // 发送完后将 ptr 指针重置到 buffer 的起始位置
+			ptr = buffer; // 发送完后将 ptr 指针重置到 buffer 的起始位置，即发送完数据后 buffer 清空
 		}
 		ikcp_ack_get(kcp, i, &seg.sn, &seg.ts); // 获取 kcp->acklist 中的第 i 个 ack，分别写入到 seg 的 sn 和 ts 字段
 		ptr = ikcp_encode_seg(ptr, &seg); // 将 seg 编码成字节流，传入 in_ptr，返回 out_ptr，字节流记录在 buffer 的 [in_ptr, out_ptr) 区间内
@@ -1077,9 +1095,9 @@ void ikcp_flush(ikcpcb *kcp)
 	if (kcp->probe & IKCP_ASK_SEND) { // 如果发现 kcp->probe 的 IKCP_ASK_SEND 位为 1，表明需要向对方发送询问窗口的 segment
 		seg.cmd = IKCP_CMD_WASK; // 将 segment 的类型标记为询问窗口类型
 		size = (int)(ptr - buffer);
-		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) { // 当 buffer 中的字节流达到了一个 kcp->mtu 长度，就发送出去
+		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) { // 如果再加入当前这个询问窗口 segment，则 buffer 中的数据量会超过 MTU 限制，因此应将目前 buffer 中的数据先发送出去
 			ikcp_output(kcp, buffer, size);
-			ptr = buffer; // 发送完后将 ptr 指针重置到 buffer 的起始位置
+			ptr = buffer; // 发送完后即清空 buffer
 		}
 		ptr = ikcp_encode_seg(ptr, &seg); // 将 segment 编码成字节流，填入到 buffer 中
 	}
@@ -1088,7 +1106,7 @@ void ikcp_flush(ikcpcb *kcp)
 	if (kcp->probe & IKCP_ASK_TELL) { // 如果发现 kcp->probe 的 IKCP_ASK_TELL 位为 1，表明需要向对方发送告知窗口的 segment
 		seg.cmd = IKCP_CMD_WINS; // 将 segment 的类型标记为告知窗口类型
 		size = (int)(ptr - buffer);
-		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) { // 当 buffer 中的字节流达到了一个 kcp->mtu 长度，就发送出去
+		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) { // 如果再加入当前这个告知窗口 segment，则 buffer 中的数据量会超过 MTU 限制，因此应将目前 buffer 中的数据先发送出去
 			ikcp_output(kcp, buffer, size);
 			ptr = buffer;
 		}
@@ -1121,7 +1139,7 @@ void ikcp_flush(ikcpcb *kcp)
 		newseg->ts = current; // 发送数据类型的 segment，其时间戳字段记录的就是该 segment 发送的时间点
 		newseg->sn = kcp->snd_nxt++; // 区间 [kcp->snd_una, kcp->snd_nxt) 标明了当前发送缓存对应的序号范围
 		newseg->una = kcp->rcv_nxt; // una 字段用以累计确认，本端向远端确认，已经接收到所有序号小于 kcp->rcv_nxt 的 segment
-		// 以下这些成员，不属于 KCP segment 的首部字段
+		// 以下这些成员，不属于 KCP segment 的首部字段，在发送时不会被携带
 		newseg->resendts = current;
 		newseg->rto = kcp->rx_rto;
 		newseg->fastack = 0;
@@ -1129,96 +1147,104 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// calculate resent
-	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff;
-	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0;
+	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff; // kcp->fastresend 表示触发快速重传的冗余 ACK 个数
+	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0; // 根据 nodelay 模式，控制第一次超时重传的时间间隔
 
 	// flush data segments
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) { // 从头到尾遍历发送缓存
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node); // 根据当前节点获取 segment
-		int needsend = 0;
-		if (segment->xmit == 0) {
-			needsend = 1;
-			segment->xmit++;
-			segment->rto = kcp->rx_rto;
-			segment->resendts = current + segment->rto + rtomin;
+		
+		int needsend = 0; // 用以标记当前这个 segment 需不需要发送出去
+
+		if (segment->xmit == 0) { // seg->xmit 用以记录该 segment 被发送的次数，如果该 segment 还没被发送过
+			needsend = 1; // 标记需要发送
+			segment->xmit++; // 该 segment 的发送次数自增一
+
+			segment->rto = kcp->rx_rto; // 为该 segment 设置超时间隔（超时重传时间）
+			segment->resendts = current + segment->rto + rtomin; // 设置该 segment 下次超时重传的时间戳
 		}
-		else if (_itimediff(current, segment->resendts) >= 0) {
+		else if (_itimediff(current, segment->resendts) >= 0) { // 目前时刻已经到了该 segment 超时重传的时间点
 			needsend = 1;
 			segment->xmit++;
-			kcp->xmit++;
+
+			kcp->xmit++; // TODO，暂时没看出来该变量的用处
+
 			if (kcp->nodelay == 0) {
 				segment->rto += _imax_(segment->rto, (IUINT32)kcp->rx_rto);
 			}	else {
-				IINT32 step = (kcp->nodelay < 2)? 
-					((IINT32)(segment->rto)) : kcp->rx_rto;
+				IINT32 step = (kcp->nodelay < 2)? ((IINT32)(segment->rto)) : kcp->rx_rto;
 				segment->rto += step / 2;
 			}
 			segment->resendts = current + segment->rto;
-			lost = 1;
+
+			lost = 1; // 标记发生了超时重传
 		}
-		else if (segment->fastack >= resent) {
-			if ((int)segment->xmit <= kcp->fastlimit || 
-				kcp->fastlimit <= 0) {
+		else if (segment->fastack >= resent) { // seg->fastack 累计记录收到 ACK 时该 segment 被跳过的次数，该字段用于快速重传功能
+			// kcp->fastlimit 用于限制快速重传功能下，一个 segment 被重传的次数，其值大于零时表示该限制开启
+			// 换句话说，开启 kcp->fastlimit 限制后，如果一个 segment 被重传了很多次，那么它就不再参与快速重传功能了
+			if ((int)segment->xmit <= kcp->fastlimit || kcp->fastlimit <= 0) { // 如果该 segment 的发送次数不大于 kcp->fastlimit，也即重传次数小于 kcp->fastlimit
 				needsend = 1;
 				segment->xmit++;
-				segment->fastack = 0;
-				segment->resendts = current + segment->rto;
-				change++;
+
+				segment->fastack = 0; // 重置该 segment 的 seg->fastack 以重新开始累计
+				segment->resendts = current + segment->rto; // 重新设置下次超时重传的时间戳
+
+				change++; // 标记发生了快速重传
 			}
 		}
 
-		if (needsend) {
+		if (needsend) { // 如果确认该 segment 需要发送（无论是首次发送，还是重传）
 			int need;
-			segment->ts = current;
-			segment->wnd = seg.wnd;
-			segment->una = kcp->rcv_nxt;
+			segment->ts = current; // 设置好该 segment 发送时的时间戳
+			segment->wnd = seg.wnd; // 告知对面的我方的剩余接收窗口
+			segment->una = kcp->rcv_nxt; // 设置好 segment 的累计确认字段
 
 			size = (int)(ptr - buffer);
-			need = IKCP_OVERHEAD + segment->len;
+			need = IKCP_OVERHEAD + segment->len; // 当前这个 segment 总的字节数（首部长度加上数据部分长度）
 
-			if (size + need > (int)kcp->mtu) {
+			if (size + need > (int)kcp->mtu) { // 如果再加入当前这个数据类型的 segment，则 buffer 中的字节数会超过 MTU 限制，因此应将目前 buffer 中的数据先发送出去
 				ikcp_output(kcp, buffer, size);
-				ptr = buffer;
+				ptr = buffer; // 发送完后 buffer 清空
 			}
 
-			ptr = ikcp_encode_seg(ptr, segment);
+			ptr = ikcp_encode_seg(ptr, segment); // 将当前这个 segment 的首部部分编码成字节流，写入到 buffer 中
 
-			if (segment->len > 0) {
+			if (segment->len > 0) { // 将当前这个 segment 的数据部分写入到 buffer 中
 				memcpy(ptr, segment->data, segment->len);
 				ptr += segment->len;
 			}
 
-			if (segment->xmit >= kcp->dead_link) {
-				kcp->state = (IUINT32)-1;
+			if (segment->xmit >= kcp->dead_link) { // kcp->dead_link 是一个 segment 的发送次数阈值，当某个 segment 发送次数达到该阈值时则认为当前 KCP 连接死亡
+				kcp->state = (IUINT32)-1; // 标记为连接死亡状态
 			}
 		}
 	}
 
-	// flush remain segments
+	// flush remain segments，将 buffer 中剩余的数据全部发送出去
 	size = (int)(ptr - buffer);
 	if (size > 0) {
 		ikcp_output(kcp, buffer, size);
 	}
 
 	// update ssthresh
-	if (change) {
-		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
-		kcp->ssthresh = inflight / 2;
-		if (kcp->ssthresh < IKCP_THRESH_MIN)
+	if (change) { // 根据标记，发生了快速重传
+		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una; // 计算目前发送窗口的首尾序号差，即发送窗口的大小
+		kcp->ssthresh = inflight / 2; // 将慢启动阈值（slow-start threshold）设置为发送窗口的一半大小
+		if (kcp->ssthresh < IKCP_THRESH_MIN) // 慢启动阈值的下限限制
 			kcp->ssthresh = IKCP_THRESH_MIN;
-		kcp->cwnd = kcp->ssthresh + resent;
-		kcp->incr = kcp->cwnd * kcp->mss;
+		kcp->cwnd = kcp->ssthresh + resent; // 拥塞窗口的设置
+		kcp->incr = kcp->cwnd * kcp->mss; // 拥塞窗口以 MSS 为单位，而 kcp->incr 就是根据 kcp->cwnd 换算成以字节为单位
 	}
 
-	if (lost) {
-		kcp->ssthresh = cwnd / 2;
-		if (kcp->ssthresh < IKCP_THRESH_MIN)
+	if (lost) { // 根据标记，发生了超时重传
+		kcp->ssthresh = cwnd / 2; // 将慢启动阈值设置为实际发送窗口的一半大小，注意 cwnd 和 kcp->cwnd 的区别
+		if (kcp->ssthresh < IKCP_THRESH_MIN) // 慢启动阈值的下限限制
 			kcp->ssthresh = IKCP_THRESH_MIN;
-		kcp->cwnd = 1;
+		kcp->cwnd = 1; // 拥塞窗口重置为 1 个 MSS
 		kcp->incr = kcp->mss;
 	}
 
-	if (kcp->cwnd < 1) {
+	if (kcp->cwnd < 1) { // 拥塞窗口最小不能小于 1 个 MSS
 		kcp->cwnd = 1;
 		kcp->incr = kcp->mss;
 	}
@@ -1347,22 +1373,22 @@ int ikcp_nodelay(ikcpcb *kcp, int nodelay, int interval, int resend, int nc)
 	if (nodelay >= 0) {
 		kcp->nodelay = nodelay;
 		if (nodelay) {
-			kcp->rx_minrto = IKCP_RTO_NDL;	
+			kcp->rx_minrto = IKCP_RTO_NDL; // kcp->rx_minrto 是超时重传间隔 RTO 的下限，nodelay 模式下设置为 IKCP_RTO_NDL
 		}	
 		else {
 			kcp->rx_minrto = IKCP_RTO_MIN;
 		}
 	}
 	if (interval >= 0) {
-		if (interval > 5000) interval = 5000;
-		else if (interval < 10) interval = 10;
-		kcp->interval = interval;
+		if (interval > 5000) interval = 5000; // 上限 clip
+		else if (interval < 10) interval = 10; // 下限 clip
+		kcp->interval = interval; // 设置 flush 刷新的时间间隔
 	}
 	if (resend >= 0) {
-		kcp->fastresend = resend;
+		kcp->fastresend = resend; // 设置快速重传功能，设置为 0 表示关闭
 	}
 	if (nc >= 0) {
-		kcp->nocwnd = nc;
+		kcp->nocwnd = nc; // 设置是否关闭拥塞控制
 	}
 	return 0;
 }
